@@ -27,8 +27,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(tokenizers_cpp)
 
 # --- 4. The Jarvis Executable ---
-# Add all future .cpp files here
-add_executable(Jarvis src/main.cpp)
+add_executable(Jarvis 
+    src/main.cpp
+    src/Model.cpp
+    src/Weights.cpp
+    src/KVCache.cpp
+)
 
 # Let the compiler know where custom headers live
 target_include_directories(Jarvis PRIVATE 

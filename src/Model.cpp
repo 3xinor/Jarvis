@@ -135,7 +135,7 @@ mx::array Phi3Attention::forward(mx::array x, KVCache& cache, mx::array mask) {
         scores = mx::add(scores, mask);
     }
     
-    auto weights = mx::softmax(scores, {-1});
+    auto weights = mx::softmax(scores, std::vector<int>{-1});
     auto context = mx::matmul(weights, active_v);
 
     // 7. Output Projection
