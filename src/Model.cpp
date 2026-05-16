@@ -2,38 +2,54 @@
 #include <mlx/fast.h> 
 #include <cmath>
 
+// --- QuantizedLinear Implementation ---
+
+QuantizedLinear::QuantizedLinear(WeightLoader& loader, const std::string& prefix)
+    // load all 3 pieces of the compressed matrix
+    : weight(loader.get(prefix + ".weight")),
+      scales(loader.get(prefix + ".scales")),
+      biases(loader.get(prefix + ".biases")) {}
+
+mx::array QuantizedLinear::forward(mx::array x) {
+    // mx::fast::quantized_matmul uses the M1 GPU to uncompress the math on the fly!
+    // The 'true' means transpose the weights. 64 is the group size, and 4 is the bits.
+    return mx::quantized_matmul(x, weight, scales, biases, true, 64, 4);
+}
+
 // --- TransformerBlock Implementation ---
 
 TransformerBlock::TransformerBlock(WeightLoader& loader, int idx) 
     : layer_idx(idx), 
       mlp(loader, idx), 
-      attention(loader, idx), // <-- Initialize attention directly here!
+      attention(loader, idx),
       input_layernorm(loader.get("model.layers." + std::to_string(idx) + ".input_layernorm.weight")),
       post_attention_layernorm(loader.get("model.layers." + std::to_string(idx) + ".post_attention_layernorm.weight"))
 {
-    // Everything is initalized in the member initializer list for efficiency and clarity.
 }
 
 mx::array TransformerBlock::forward(mx::array x, KVCache& cache, mx::array mask) {
-    // 1. Attention Path
     auto h = input_layernorm.forward(x);
     h = attention.forward(h, cache, mask);
-    x = mx::add(x, h); // First Residual
+    x = mx::add(x, h); 
 
-    // 2. MLP Path
     h = post_attention_layernorm.forward(x);
     h = mlp.forward(h);
-    x = mx::add(x, h); // Second Residual
+    x = mx::add(x, h); 
 
     return x;
 }
 
+// --- Phi3MLP Implementation ---
+
 Phi3MLP::Phi3MLP(WeightLoader& loader, int layer_idx) 
-    : gate_up_proj(loader.get("model.layers." + std::to_string(layer_idx) + ".mlp.gate_up_proj.weight")),
-      down_proj(loader.get("model.layers." + std::to_string(layer_idx) + ".mlp.down_proj.weight")) {}
+    // Notice how we just pass the prefix now, dropping the ".weight"!
+    : gate_up_proj(loader, "model.layers." + std::to_string(layer_idx) + ".mlp.gate_up_proj"),
+      down_proj(loader, "model.layers." + std::to_string(layer_idx) + ".mlp.down_proj") {}
 
 mx::array Phi3MLP::forward(mx::array x) {
-    auto fused_output = mx::matmul(x, mx::transpose(gate_up_proj));
+    // Quantized forward pass
+    auto fused_output = gate_up_proj.forward(x);
+    
     auto parts = mx::split(fused_output, 2, -1);
     auto gate = parts[0];
     auto up = parts[1];
@@ -41,7 +57,8 @@ mx::array Phi3MLP::forward(mx::array x) {
     auto activated_gate = mx::multiply(gate, mx::sigmoid(gate));
     auto intermediate = mx::multiply(activated_gate, up);
     
-    return mx::matmul(intermediate, mx::transpose(down_proj));
+    // Quantized forward pass
+    return down_proj.forward(intermediate);
 }
 
 // --- RMSNorm Implementation ---
@@ -49,22 +66,23 @@ mx::array Phi3MLP::forward(mx::array x) {
 RMSNorm::RMSNorm(mx::array w, float e) : weight(w), eps(e) {}
 
 mx::array RMSNorm::forward(mx::array x) {
-    // 1. Calculate the variance: mean of squares along the last axis
-    auto variance = mx::mean(mx::square(x), -1, true);
-    
-    // 2. Calculate the inverse square root: 1 / sqrt(variance + epsilon)
+    // Upcast to float32 to prevent variance math overflow
+    auto x_f32 = mx::astype(x, mx::float32);
+    auto variance = mx::mean(mx::square(x_f32), -1, true);
     auto inv_rms = mx::rsqrt(mx::add(variance, mx::array(eps)));
+    auto normalized = mx::multiply(x_f32, inv_rms);
     
-    // 3. Scale input by the inverse RMS, then multiply by the learned weights
-    auto normalized = mx::multiply(x, inv_rms);
-    return mx::multiply(normalized, weight);
+    // Downcast back to original precision and apply weights
+    auto out = mx::astype(normalized, x.dtype());
+    return mx::multiply(out, weight);
 }
 
 // --- Attention Implementation ---
 
 Phi3Attention::Phi3Attention(WeightLoader& loader, int layer_idx) 
-    : qkv_proj(loader.get("model.layers." + std::to_string(layer_idx) + ".self_attn.qkv_proj.weight")),
-      o_proj(loader.get("model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj.weight"))
+    // Notice how we just pass the prefix now, dropping the ".weight"!
+    : qkv_proj(loader, "model.layers." + std::to_string(layer_idx) + ".self_attn.qkv_proj"),
+      o_proj(loader, "model.layers." + std::to_string(layer_idx) + ".self_attn.o_proj")
 {
     scale = 1.0f / std::sqrt((float)head_dim);
 }
@@ -73,8 +91,7 @@ mx::array Phi3Attention::forward(mx::array x, KVCache& cache, mx::array mask) {
     int batch_size = x.shape(0);
     int seq_len = x.shape(1);
 
-    // 1. Fused QKV projection & Split
-    auto qkv = mx::matmul(x, mx::transpose(qkv_proj));
+    auto qkv = qkv_proj.forward(x);
 
     int q_size = n_heads * head_dim;
     int kv_size = n_kv_heads * head_dim;
@@ -87,62 +104,130 @@ mx::array Phi3Attention::forward(mx::array x, KVCache& cache, mx::array mask) {
     k = mx::reshape(k, {batch_size, seq_len, n_kv_heads, head_dim});
     v = mx::reshape(v, {batch_size, seq_len, n_kv_heads, head_dim});
 
-    // 2. Apply RoPE (Rotary Positional Embeddings)
-    // We rotate Q and K based on their position in the sequence (cache.offset).
-    // Phi-3 uses a base of 10000.0f and non-traditional rotation.
-    q = mx::fast::rope(q, head_dim, false, 10000.0f, 1.0f, cache.offset);
-    k = mx::fast::rope(k, head_dim, false, 10000.0f, 1.0f, cache.offset);
+    // 1. Transpose to [Batch, Heads, SeqLen, HeadDim] so RoPE rotates the words
+    q = mx::transpose(q, {0, 2, 1, 3});
+    k = mx::transpose(k, {0, 2, 1, 3});
 
-    // 3. Update KV Cache (Lean Memory Strategy)
-    std::vector<int> start = {0, cache.offset, 0, 0};
-    std::vector<int> end = {batch_size, cache.offset + seq_len, n_kv_heads, head_dim};
-    
-    // Grab the cache data BEFORE our current offset
+    // 2. Apply RoPE
+    q = mx::fast::rope(q, head_dim, true, 10000.0f, 1.0f, cache.offset);
+    k = mx::fast::rope(k, head_dim, true, 10000.0f, 1.0f, cache.offset);
+
+    // 3. Transpose BACK to [Batch, SeqLen, Heads, HeadDim] for the KVCacheff
+    q = mx::transpose(q, {0, 2, 1, 3});
+    k = mx::transpose(k, {0, 2, 1, 3});
+
     auto k_before = mx::slice(cache.keys, {0, 0, 0, 0}, {batch_size, cache.offset, n_kv_heads, head_dim});
     auto v_before = mx::slice(cache.values, {0, 0, 0, 0}, {batch_size, cache.offset, n_kv_heads, head_dim});
     
-    // Grab the empty buffer AFTER our new tokens
     auto k_after = mx::slice(cache.keys, {0, cache.offset + seq_len, 0, 0}, {batch_size, cache.max_tokens, n_kv_heads, head_dim});
     auto v_after = mx::slice(cache.values, {0, cache.offset + seq_len, 0, 0}, {batch_size, cache.max_tokens, n_kv_heads, head_dim});
     
-    // Paste them together along axis 1 (the sequence length axis)
     cache.keys = mx::concatenate({k_before, k, k_after}, 1);
     cache.values = mx::concatenate({v_before, v, v_after}, 1);
     
-    // Retrieve the active context window so far
     auto active_k = mx::slice(cache.keys, {0, 0, 0, 0}, {batch_size, cache.offset + seq_len, n_kv_heads, head_dim});
     auto active_v = mx::slice(cache.values, {0, 0, 0, 0}, {batch_size, cache.offset + seq_len, n_kv_heads, head_dim});
 
-    // 4. Grouped-Query Attention (GQA) Broadcasting
-    // Phi-3 has 32 Q heads but only 8 K/V heads. We must duplicate the K/V heads 
-    // 4 times each so they align for the matrix multiplication.
-    int repeat_factor = n_heads / n_kv_heads; // 32 / 8 = 4
-    active_k = mx::repeat(active_k, repeat_factor, 2); 
-    active_v = mx::repeat(active_v, repeat_factor, 2);
-
-    // 5. Transpose for Matrix Math [batch, heads, seq_len, head_dim]
     q = mx::transpose(q, {0, 2, 1, 3});
     active_k = mx::transpose(active_k, {0, 2, 1, 3});
     active_v = mx::transpose(active_v, {0, 2, 1, 3});
 
-    // 6. Scaled Dot-Product Attention
-    // Scores = (Q * K^T) / sqrt(head_dim)
     auto scores = mx::matmul(q, mx::transpose(active_k, {0, 1, 3, 2}));
     scores = mx::multiply(scores, mx::array(scale));
     
-    // Apply causal mask (prevents looking into the future during training/prompting)
     if (mask.size() > 0) {
-        scores = mx::add(scores, mask);
+        // Cast mask to match scores dtype so we don't rely on implicit type promotion
+        scores = mx::add(scores, mx::astype(mask, scores.dtype()));
     }
     
-    auto weights = mx::softmax(scores, {-1});
+    // Upcast scores to float32 before softmax to prevent exponential overflow
+    auto scores_f32 = mx::astype(scores, mx::float32);
+    auto weights_f32 = mx::softmax(scores_f32, std::vector<int>{-1});
+    
+    // Downcast weights back to float16
+    auto weights = mx::astype(weights_f32, scores.dtype());
+    
     auto context = mx::matmul(weights, active_v);
-
-    // 7. Output Projection
-    // Transpose back to [batch, seq_len, heads, head_dim] and flatten
     context = mx::transpose(context, {0, 2, 1, 3});
     auto flat_context = mx::reshape(context, {batch_size, seq_len, n_heads * head_dim});
-    
-    return mx::matmul(flat_context, mx::transpose(o_proj));
+
+    return o_proj.forward(flat_context);
 }
 
+// --- Phi3Model Implementation ---
+
+Phi3Model::Phi3Model(WeightLoader& loader) 
+    : embed_tokens(loader.get("model.embed_tokens.weight")),
+      norm(loader.get("model.norm.weight")),
+      lm_head(loader.get("lm_head.weight"))
+{
+    // 1. Decompress the input dictionary
+    if (embed_tokens.shape(1) == 384) {
+        auto scales = loader.get("model.embed_tokens.scales");
+        
+        // Initialize with zeros first to avoid default constructor error!
+        auto biases = mx::zeros(scales.shape(), scales.dtype()); 
+        
+        // Check if the safetensors file contains the zero-point shifts, overwrite if true
+        if (loader.weights.find("model.embed_tokens.biases") != loader.weights.end()) {
+            biases = loader.get("model.embed_tokens.biases");
+            std::cout << "[SYSTEM] SafeTensors contains Embedded Tokens bias'.\n";
+        }
+        
+        embed_tokens = mx::dequantize(embed_tokens, scales, biases, 64, 4);
+        std::cout << "[SYSTEM] Decompressed Token Embeddings to 3072 dimensions.\n";
+    }
+
+    // 2. Decompress the final output vocabulary (LM Head)
+    if (lm_head.shape(1) == 384) {
+        auto scales = loader.get("lm_head.scales");
+        
+        // Initialize with zeros first to avoid default constructor error!
+        auto biases = mx::zeros(scales.shape(), scales.dtype()); 
+        
+        // Check if the safetensors file contains the zero-point shifts, overwrite if true
+        if (loader.weights.find("lm_head.biases") != loader.weights.end()) {
+            biases = loader.get("lm_head.biases");
+            std::cout << "[SYSTEM] SafeTensors contains LM Head bias'.\n";
+        }
+        
+        lm_head = mx::dequantize(lm_head, scales, biases, 64, 4);
+        std::cout << "[SYSTEM] Decompressed LM Head to 3072 dimensions.\n";
+    }
+
+    // 3. Initialize the 32 layers
+    for (int i = 0; i < 32; ++i) {
+        layers.emplace_back(loader, i);
+    }
+}
+
+mx::array Phi3Model::forward(mx::array inputs, std::vector<KVCache>& caches) {
+    auto h = mx::take(embed_tokens, inputs, 0);
+    int seq_len = inputs.shape(1);
+    mx::array mask = mx::array({}); 
+
+    if (seq_len > 1) {
+        std::vector<float> mask_data(seq_len * seq_len, 0.0f);
+        for (int i = 0; i < seq_len; ++i) {
+            for (int j = i + 1; j < seq_len; ++j) {
+                mask_data[i * seq_len + j] = -10000.0f; 
+            }
+        }
+        mask = mx::array(mask_data.data(), {1, 1, seq_len, seq_len});
+    }
+
+    // Pass the matching cache to each specific layer
+    for (int i = 0; i < layers.size(); ++i) {
+        h = layers[i].forward(h, caches[i], mask);
+    }
+
+    h = norm.forward(h);
+
+    int batch_size = h.shape(0);
+    int hidden_dim = h.shape(2);
+    
+    auto last_token_h = mx::slice(h, {0, seq_len - 1, 0}, {batch_size, seq_len, hidden_dim});
+    auto logits = mx::matmul(last_token_h, mx::transpose(lm_head));
+
+    return logits;
+}

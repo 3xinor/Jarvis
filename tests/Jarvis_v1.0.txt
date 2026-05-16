@@ -1,0 +1,20 @@
+Dave: hi======================================================
+                 BOOTING JARVIS v1.0                 
+======================================================
+[SYSTEM] Engine       : C++ / Apple MLX Backend
+[SYSTEM] Precision    : 4-bit Quantized (Unified Memory Optimized)
+[SYSTEM] Architecture : Phi-3 (32 Layers, 32 Attention Heads)
+[SYSTEM] Context Size : 4096 Tokens
+======================================================
+
+[SYSTEM] Loading Tokenizer...
+[SYSTEM] Loading Neural Network Weights into Unified Memory...
+[Brain]  Loaded 455 tensors from ../models/phi3/model.safetensors
+[SYSTEM] Assembling Phi-3 Architecture...
+[SYSTEM] Decompressed Token Embeddings to 3072 dimensions.
+[SYSTEM] Decompressed LM Head to 3072 dimensions.
+
+[JARVIS IS ONLINE. TYPE 'exit' TO QUIT]
+------------------------------------------------------
+
+Jarvis: SudvoidBorChronvoidBorChronidevoidBorChronvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoidBorChronuilvoid
