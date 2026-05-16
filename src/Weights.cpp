@@ -7,7 +7,7 @@ void WeightLoader::load(const std::string& safetensors_path) {
     // 2. Extract ONLY the tensor map (.arrays) and assign it to our variable
     weights = load_result.first; // .first contains the tensor map, .second contains the metadata
     
-    std::cout << "[Brain] Loaded " << weights.size() << " tensors from " << safetensors_path << std::endl;
+    std::cout << "[Brain]  Loaded " << weights.size() << " tensors from " << safetensors_path << std::endl;
 }
 
 mx::array WeightLoader::get(const std::string& key) {
