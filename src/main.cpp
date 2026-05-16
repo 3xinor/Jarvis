@@ -84,50 +84,69 @@ int main() {
         // Turn text into integer IDs
         std::vector<int> tokens = tokenizer->Encode(prompt);
 
-        // Initialize our KV Cache for a batch size of 1, 32 KV heads, and 96 dimensions.
-        // We use float32 to match the un-quantized intermediate math.
-        KVCache cache(1, 32, 96, mx::float32);
+        // Phi-3 requires Token ID 1 (<s>) at position 0 to anchor its spatial awareness.
+        tokens.insert(tokens.begin(), 1);
+
+        // --- DEBUG PRINT 1: TOKEN INSPECTION ---
+        // std::cout << "[DEBUG] Total Input Tokens: " << tokens.size() << "\n";
+        // std::cout << "[DEBUG] First 10 Token IDs: ";
+        // for(int i = 0; i < std::min(10, (int)tokens.size()); i++) {
+        //     std::cout << tokens[i] << " ";
+        // }
+        // std::cout << "\n----------------------------------------\n";
+
+        // Initialize an array of 32 KV Caches (one for each layer)
+        std::vector<KVCache> caches;
+        for(int i = 0; i < 32; i++) {
+            caches.emplace_back(1, 32, 96, mx::float16);
+        }
 
         std::cout << "Jarvis: ";
 
         // --- 4. THE AUTO-REGRESSIVE GENERATION LOOP ---
         // We feed the current sequence, predict the next token, and append it.
         mx::array current_tokens = mx::array(tokens.data(), {1, (int)tokens.size()});
-        
         int max_gen_tokens = 256;
-        int eos_token_id = 32000; // Phi-3's <|end|> token ID
+        int eos_token_id = 32000; 
 
         for (int step = 0; step < max_gen_tokens; ++step) {
             
-            // Forward pass through all 32 layers
-            mx::array logits = model.forward(current_tokens, cache);
+            // Pass the vector of caches
+            mx::array logits = model.forward(current_tokens, caches);
 
-            // Get the ID of the highest probability word (argmax)
+            // --- DEBUG PRINT 2: NAN DETECTOR ---
+            // Force MLX to evaluate the logits early so we can inspect them
+            mx::eval(logits); 
+            
+            // std::cout << "[DEBUG] Logits Shape: [" << logits.shape(0) << ", " 
+            //         << logits.shape(1) << ", " << logits.shape(2) << "]\n";
+                    
+            // // Summing the logits is a quick trick. If there is a single NaN 
+            // // anywhere in the massive array, the sum will evaluate to NaN.
+            // float logits_sum = mx::sum(logits).item<float>();
+            // std::cout << "[DEBUG] Logits Sum (Should be a number): " << logits_sum << "\n";
+            // std::cout << "----------------------------------------\n";
+
             auto next_token_array = mx::argmax(logits, -1);
 
-            // CRITICAL: MLX is lazy. This eval() command forces the M1 GPU to 
-            // actually execute all the math in the graph we just built.
+            // Evaluate the token AND the state of all 32 caches
+            // to prevent the MLX computation graph from infinitely expanding.
             mx::eval(next_token_array);
-
-            // Extract the integer from the MLX array
-            int next_token_id = next_token_array.item<int>();
-
-            // Stop if Jarvis generates the End-Of-Sequence token
-            if (next_token_id == eos_token_id) {
-                break;
+            for(auto& c : caches) {
+                mx::eval(c.keys, c.values);
             }
 
-            // Decode and print the single token to the screen
-            std::cout << tokenizer->Decode({next_token_id}) << std::flush;
+            int next_token_id = next_token_array.item<int>();
+            if (next_token_id == eos_token_id) break;
 
-            // Prepare the generated token to be the input for the next loop
+            std::cout << tokenizer->Decode({next_token_id}) << std::flush;
             current_tokens = mx::reshape(next_token_array, {1, 1});
             
-            // Advance the cache offset so the model remembers the past!
+            // Advance the offset for ALL layers
             if (step == 0) {
-                cache.offset += tokens.size(); // First step processes the whole prompt
+                for(auto& c : caches) c.offset += tokens.size();
             } else {
-                cache.offset += 1; // Subsequent steps process 1 token at a time
+                for(auto& c : caches) c.offset += 1;
             }
         }
         std::cout << std::endl;

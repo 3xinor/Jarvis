@@ -83,5 +83,5 @@ public:
     Phi3Model(WeightLoader& loader);
 
     // The main forward pass
-    mx::array forward(mx::array inputs, KVCache& cache);
+    mx::array forward(mx::array inputs, std::vector<KVCache>& caches);
 };
